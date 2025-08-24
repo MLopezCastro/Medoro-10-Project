@@ -1,9 +1,72 @@
-# MEDORO 10 – Secuencias y Bloques por OT\n\n> **Objetivo:** incorporar dos vistas nuevas para consolidar eventos en *bloques de producción/preparación por OT y por día*, generar un índice de secuencia global estable y habilitar ordenamientos/controles robustos desde Power BI.\n\n---\n\n## 🧱 Vistas incluidas\n\n1) **`dbo.ConCuboSecuenciasBloques`**  \
-   Colapsa filas de `ConCubo3AñosSecFlag` en **bloques por OT** cuando la misma OT continúa sin intercalarse otra distinta, **a nivel de día**. Devuelve totales (buenos/malos/horas), rangos de inicio/fin del bloque, *sort key* estable y *rankings* por día.\n\n2) **`dbo.ConCuboSecuenciasBloques_Rango`**  \
-   Extiende la anterior agregando **`OrdenGlobalText`** (clave de ordenamiento textual) y **`SecuenciaGlobalSQL`** (**índice global 1..N** que no se reinicia por día ni por filtros).\n\n---\n\n## 📦 Fuente de datos y supuestos clave\n- Base: **`ConCubo3AñosSecFlag`** (eventos ya corregidos de fecha y con flags).\n- Se descartan filas **sin `Inicio_Corregido` o `Fin_Corregido`**.\n- Se suman métricas: `HorasProd`, `HorasPrep`, `HorasPara`, `HorasMant`, `CantBuenos`, `CantMalos`.\n- **Cambio de OT** detectado con `LAG(ID_Limpio)` **particionado por `Renglon`** y ordenado por `Inicio_Corregido`.\n- **Agrupación diaria:** cada bloque es por **OT + Renglón + Día**.\n- Enriquecimiento con `saccod1` desde `TablaVinculadaUNION` (vía `TRY_CAST(OP AS INT)` y `ISNUMERIC(OP)=1`).\n\n---\n\n## 🔑 Campos principales (salida)\n**`ConCuboSecuenciasBloques`**\n- `Renglon`, `ID`, `ID_Limpio`, `saccod1`\n- `CodProducto` (del bloque), `FechaSecuencia` (date), `InicioSecuencia`, `FinSecuencia`\n- Totales: `BuenosTotal`, `MalosTotal`, `HorasProd`, `HorasPrep`, `HorasPara`, `HorasMant`\n- `FilasColapsadas` (conteo de filas originales dentro del bloque)\n- **Ordenación y control por día:**\n  - `NumeroBloqueDiaSQL`: ordinal global del **día** (todas las máquinas)\n  - `NumeroBloqueDiaPorRenglonSQL`: ordinal del **día** por `Renglon`\n- **`SortKey`**: bigint creciente por **(hora + renglón + OT)** para ordenar/ranquear en PBI\n\n**`ConCuboSecuenciasBloques_Rango`** (además):\n- **`OrdenGlobalText`**: `yyyyMMddHHmmss` + `Renglon(4)` + `ID_Limpio(10)`\n- **`SecuenciaGlobalSQL`**: `ROW_NUMBER()` global por `(InicioSecuencia, Renglon, ID_Limpio)`\n\n---\n\n## ❓¿Por qué dos vistas y no una?\n- **`ConCuboSecuenciasBloques`** es la **vista base** para analítica diaria y KPIs por bloque.\n- **`ConCuboSecuenciasBloques_Rango`** agrega llaves/índices **globales** para **controles de rango**, comparativas a través del tiempo y **scroll ordenado** en Power BI, sin recalcular en el modelo.\n\n---\n\n## 🧮 Lógica de bloques (resumen)\n1. Orden cronológico por `Inicio_Corregido` **dentro de cada `Renglon`**.\n2. **Nuevo bloque** cuando cambia `ID_Limpio` respecto del `LAG`.\n3. Se numera acumulativamente con `SUM(CambioID)` → `GrupoOT`.\n4. Se agrupa por **`Renglon, GrupoOT, ID, ID_Limpio, CONVERT(date, Inicio_Corregido)`** para consolidar el **bloque diario**.\n5. Se calculan totales y fechas de **inicio/fin** del bloque.\n\n---\n\n## 🧰 Definiciones (SQL)\n\n> **Vista 1 – `dbo.ConCuboSecuenciasBloques`**\n\n```sql\nCREATE OR ALTER VIEW dbo.ConCuboSecuenciasBloques AS\nWITH VU AS (\n    SELECT TRY_CAST(OP AS INT) AS ID_Limpio, MIN(saccod1) AS saccod1\n    FROM dbo.TablaVinculadaUNION\n    WHERE ISNUMERIC(OP)=1\n    GROUP BY TRY_CAST(OP AS INT)\n),\nBase AS (\n    SELECT\n        s.Renglon, s.ID, s.ID_Limpio,\n        s.Inicio_Corregido, s.Fin_Corregido,\n        CAST(ISNULL(s.CantidadBuenosProducida,0) AS DECIMAL(18,4)) AS CantBuenos,\n        CAST(ISNULL(s.CantidadMalosProducida ,0) AS DECIMAL(18,4)) AS CantMalos,\n        CAST(ISNULL(s.Horas_Produccion       ,0) AS DECIMAL(18,6)) AS HorasProd,\n        CAST(ISNULL(s.Horas_Preparacion      ,0) AS DECIMAL(18,6)) AS HorasPrep,\n        CAST(ISNULL(s.Horas_Parada           ,0) AS DECIMAL(18,6)) AS HorasPara,\n        CAST(ISNULL(s.Horas_Mantenimiento    ,0) AS DECIMAL(18,6)) AS HorasMant,\n        s.CodProducto\n    FROM dbo.ConCubo3AñosSecFlag s\n    WHERE s.Inicio_Corregido IS NOT NULL AND s.Fin_Corregido IS NOT NULL\n),\nMarcado AS (\n    SELECT *,\n        CASE WHEN LAG(ID_Limpio) OVER (PARTITION BY Renglon ORDER BY Inicio_Corregido)=ID_Limpio\n             THEN 0 ELSE 1 END AS CambioID\n    FROM Base\n),\nGrupos AS (\n    SELECT *,\n        SUM(CambioID) OVER (PARTITION BY Renglon ORDER BY Inicio_Corregido\n                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS GrupoOT\n    FROM Marcado\n),\nDia AS (\n    SELECT\n        Renglon, ID, ID_Limpio, GrupoOT,\n        CONVERT(date, Inicio_Corregido) AS FechaSecuencia,\n        MIN(Inicio_Corregido) AS InicioSecuencia,\n        MAX(Fin_Corregido)    AS FinSecuencia,\n        MAX(CodProducto)      AS CodProducto_Bloque,\n        SUM(CantBuenos)       AS BuenosTotal,\n        SUM(CantMalos)        AS MalosTotal,\n        SUM(HorasProd)        AS HorasProd,\n        SUM(HorasPrep)        AS HorasPrep,\n        SUM(HorasPara)        AS HorasPara,\n        SUM(HorasMant)        AS HorasMant,\n        COUNT(*)              AS FilasColapsadas\n    FROM Grupos\n    GROUP BY Renglon, GrupoOT, ID, ID_Limpio, CONVERT(date, Inicio_Corregido)\n)\nSELECT\n    d.Renglon, d.ID, d.ID_Limpio,\n    d.CodProducto_Bloque AS CodProducto,\n    d.FechaSecuencia,\n    CONVERT(varchar(16), d.InicioSecuencia, 120) AS FechaSecuenciaTextoHora, -- YYYY-MM-DD HH:MM\n    d.InicioSecuencia, d.FinSecuencia,\n    d.BuenosTotal, d.MalosTotal, d.HorasProd, d.HorasPrep, d.HorasPara, d.HorasMant,\n    d.FilasColapsadas,\n\n    ROW_NUMBER() OVER (\n        PARTITION BY d.FechaSecuencia\n        ORDER BY d.InicioSecuencia, d.Renglon, d.ID_Limpio\n    ) AS NumeroBloqueDiaSQL,\n\n    ROW_NUMBER() OVER (\n        PARTITION BY d.FechaSecuencia, d.Renglon\n        ORDER BY d.InicioSecuencia, d.ID_Limpio\n    ) AS NumeroBloqueDiaPorRenglonSQL,\n\n    CAST(FORMAT(d.InicioSecuencia,'yyyyMMddHHmmss') AS bigint) * 10000000000\n      + CAST(d.Renglon AS bigint) * 1000000000\n      + CAST(d.ID_Limpio AS bigint)                 AS SortKey,\n\n    VU.saccod1\nFROM Dia d\nLEFT JOIN VU ON VU.ID_Limpio = d.ID_Limpio;\nGO\n```\n\n> **Vista 2 – `dbo.ConCuboSecuenciasBloques_Rango`**\n\n```sql\nCREATE OR ALTER VIEW dbo.ConCuboSecuenciasBloques_Rango AS\nSELECT\n    d.*,\n\n    -- 🔑 clave de orden estable (texto: fecha-hora + renglón + OT)\n    FORMAT(d.InicioSecuencia,'yyyyMMddHHmmss')\n    + RIGHT('0000' + CAST(d.Renglon AS varchar(4)), 4)\n    + RIGHT('0000000000' + CAST(d.ID_Limpio AS varchar(10)), 10) AS OrdenGlobalText,\n\n    -- 🔢 índice GLOBAL 1..N (NO se reinicia por día ni por filtro)\n    ROW_NUMBER() OVER (\n        ORDER BY d.InicioSecuencia, d.Renglon, d.ID_Limpio\n    ) AS SecuenciaGlobalSQL\nFROM dbo.ConCuboSecuenciasBloques AS d;\nGO\n```\n\n---\n\n## 🧪 Controles y validaciones sugeridas\n1) **Integridad temporal**  
-```sql\nSELECT TOP (50) *\nFROM dbo.ConCuboSecuenciasBloques\nORDER BY SortKey;\n```\n- Verificar que el orden cronológico coincide con `InicioSecuencia` y que no hay inversiones.\n\n2) **Cruce con totales originales**  
-```sql\nSELECT ID_Limpio, FechaSecuencia,\n       SUM(HorasProd) AS HorasProd_Bloques,\n       SUM(HorasPrep) AS HorasPrep_Bloques\nFROM dbo.ConCuboSecuenciasBloques\nGROUP BY ID_Limpio, FechaSecuencia;\n```\n- Comparar contra la tabla de detalle para una OT/día.\n\n3) **Secuencia global estable**  
-```sql\nSELECT TOP (50) SecuenciaGlobalSQL, OrdenGlobalText, *\nFROM dbo.ConCuboSecuenciasBloques_Rango\nORDER BY SecuenciaGlobalSQL;\n```\n- Confirmar que no se reinicia y que avanza de forma consistente.\n\n4) **Distribución por renglón y día**  
-```sql\nSELECT FechaSecuencia, Renglon, COUNT(*) AS Bloques\nFROM dbo.ConCuboSecuenciasBloques\nGROUP BY FechaSecuencia, Renglon\nORDER BY FechaSecuencia, Renglon;\n```\n\n---\n\n## 📊 Uso recomendado en Power BI\n- **Tabla de Bloques (hechos):** `ConCuboSecuenciasBloques`\n  - Ordenar por **`SortKey`** para narrativas temporales.\n  - Slicers por `FechaSecuencia`, `Renglon`, `ID_Limpio`, `saccod1`, `CodProducto`.\n  - KPIs: `%Prep = DIVIDE(SUM(HorasPrep), SUM(HorasProd))`, \n    `%Parada = DIVIDE(SUM(HorasPara), SUM(HorasProd))`, etc.\n- **Controles de rango/scroll:** `ConCuboSecuenciasBloques_Rango`\n  - Usar `SecuenciaGlobalSQL` para **paginado lógico** o bookmarks.\n  - `OrdenGlobalText` como etiqueta/clave al exportar o depurar.\n- **Relaciones:** si existen tablas por **OT** o **Producto**, relacionar por `ID_Limpio` y/o `CodProducto` (tener en cuenta granularidades).\n- **Evitar jerarquía automática de fecha**: usar `FechaSecuencia` (date) y, cuando se necesite hora exacta, **`InicioSecuencia`** (datetime) o el campo **`FechaSecuenciaTextoHora`** como texto legible en visuales que no deben jerarquizar.\n\n---\n\n## ⚠️ Notas y performance\n- **SQL Server 2014+**: las funciones usadas (`TRY_CAST`, `FORMAT`, `LAG`, `ROW_NUMBER`) están disponibles. `FORMAT` es conveniente pero más costoso; mantener su uso acotado a claves de ordenamiento.\n- **ISNUMERIC(OP)=1** puede aceptar algunos formatos no deseados (como exponentes). Si aparecen casos raros, considerar un filtro más estricto (ej.: `OP NOT LIKE '%.%' AND OP NOT LIKE '%e%'`).\n- **Granularidad**: los bloques son **por día**. Si una OT continúa al día siguiente, **se abre un nuevo bloque**.\n- **Filas colapsadas**: útil para detectar eventos muy fragmentados.\n\n---\n\n## 🧭 Casos de uso típicos\n- **Timeline ordenado de producción/preparación** por máquina u OT.\n- **Control diario de sequenciación**: usar `NumeroBloqueDiaSQL` para validar el orden del shopfloor.\n- **Análisis de eficiencia** por bloque: horas de preparación vs producción, paradas, mantenimiento.\n- **Auditoría**: exportar con `OrdenGlobalText` para reproducir órdenes en Excel.\n\n---\n\n## 🧷 Fragmentos útiles (SQL)\n**1) Últimos N bloques por máquina**\n```sql\nSELECT TOP (200) *\nFROM dbo.ConCuboSecuenciasBloques\nWHERE Renglon = 201\nORDER BY SortKey DESC;\n```\n\n**2) Foto de un día (todas las máquinas)**\n```sql\nSELECT *\nFROM dbo.ConCuboSecuenciasBloques\nWHERE FechaSecuencia = '2025-06-11'\nORDER BY NumeroBloqueDiaSQL;\n```\n\n**3) Secuencia global en rango**\n```sql\nSELECT *\nFROM dbo.ConCuboSecuenciasBloques_Rango\nWHERE SecuenciaGlobalSQL BETWEEN 12000 AND 12100\nORDER BY SecuenciaGlobalSQL;\n```\n\n**4) KPI simple por OT**\n```sql\nSELECT ID_Limpio,\n       SUM(HorasProd) AS HProd,\n       SUM(HorasPrep) AS HPrep,\n       100.0 * SUM(HorasPrep)/NULLIF(SUM(HorasProd),0) AS Prep_pct\nFROM dbo.ConCuboSecuenciasBloques\nGROUP BY ID_Limpio\nORDER BY Prep_pct DESC;\n```\n\n---\n\n## 📝 Changelog (Medoro 10)\n- ✅ Nueva vista `ConCuboSecuenciasBloques` con consolidación diaria por bloques y *sort key* estable.\n- ✅ Nueva vista `ConCuboSecuenciasBloques_Rango` con **índice global** y **clave textual** para ordenamiento/export.\n- ✅ Guía de integración con Power BI y validaciones SQL.\n\n---\n\n## 📌 Próximos pasos sugeridos\n- Agregar **medidas DAX** estándar al modelo (eficiencias, ratios, OEE si aplica).\n- Crear una **página de control** en PBI con *SecuenciaGlobalSQL* para navegar bloques.\n- Incorporar `saccod1` en segmentaciones y matrices de detalle.\n- (Opcional) Versionar una **tabla materializada** nocturna si el volumen crece y la latencia de vistas resulta alta.\n\n---\n\n## 👤 Autor\n**Marcelo F. López Castro** – Proyecto MEDORO 10  
-SQL Server · Power BI · Data Analytics\n
+# MEDORO 10 – Secuencias y Bloques por OT
+
+> **Objetivo:** incorporar dos vistas nuevas para consolidar eventos en *bloques de producción/preparación por OT y por día*, generar un índice de secuencia global estable y habilitar ordenamientos/controles robustos desde Power BI.
+
+---
+
+## 🧱 Vistas incluidas
+
+1. **`dbo.ConCuboSecuenciasBloques`**  
+   Colapsa filas de `ConCubo3AñosSecFlag` en **bloques por OT** cuando la misma OT continúa sin intercalarse otra distinta, a **nivel de día**.  
+   Devuelve totales (buenos/malos/horas), rangos de inicio/fin del bloque, *sort key* estable y *rankings* por día.
+
+2. **`dbo.ConCuboSecuenciasBloques_Rango`**  
+   Extiende la anterior agregando `OrdenGlobalText` (clave de ordenamiento textual) y `SecuenciaGlobalSQL` (índice global 1..N que no se reinicia por día ni por filtros).
+
+---
+
+## 📦 Fuente de datos y supuestos clave
+- Base: **`ConCubo3AñosSecFlag`** (eventos ya corregidos de fecha y con flags).  
+- Se descartan filas sin `Inicio_Corregido` o `Fin_Corregido`.  
+- Se suman métricas: `HorasProd`, `HorasPrep`, `HorasPara`, `HorasMant`, `CantBuenos`, `CantMalos`.  
+- **Cambio de OT** detectado con `LAG(ID_Limpio)` particionado por `Renglon` y ordenado por `Inicio_Corregido`.  
+- **Agrupación diaria:** cada bloque es por **OT + Renglón + Día**.  
+- Enriquecimiento con `saccod1` desde `TablaVinculadaUNION` (vía `TRY_CAST(OP AS INT)` e `ISNUMERIC(OP)=1`).  
+
+---
+
+## 🔑 Campos principales (salida)
+
+### `ConCuboSecuenciasBloques`
+- `Renglon`, `ID`, `ID_Limpio`, `saccod1`  
+- `CodProducto`, `FechaSecuencia`, `InicioSecuencia`, `FinSecuencia`  
+- Totales: `BuenosTotal`, `MalosTotal`, `HorasProd`, `HorasPrep`, `HorasPara`, `HorasMant`  
+- `FilasColapsadas` (conteo de filas originales dentro del bloque)  
+- **Ordenación y control por día:**  
+  - `NumeroBloqueDiaSQL`: ordinal global del día (todas las máquinas)  
+  - `NumeroBloqueDiaPorRenglonSQL`: ordinal del día por renglón  
+- **`SortKey`**: bigint creciente por (hora + renglón + OT)
+
+### `ConCuboSecuenciasBloques_Rango` (además)
+- `OrdenGlobalText`: `yyyyMMddHHmmss` + `Renglon(4)` + `ID_Limpio(10)`  
+- `SecuenciaGlobalSQL`: `ROW_NUMBER()` global por `(InicioSecuencia, Renglon, ID_Limpio)`  
+
+---
+
+## ❓ ¿Por qué dos vistas y no una?
+- **`ConCuboSecuenciasBloques`** es la **vista base** para analítica diaria y KPIs por bloque.  
+- **`ConCuboSecuenciasBloques_Rango`** agrega llaves/índices **globales** para controles de rango y ordenamientos en Power BI.  
+
+---
+
+## 📊 Uso en Power BI
+- Usar `ConCuboSecuenciasBloques` como **tabla de hechos** (bloques).  
+- Ordenar siempre por `SortKey` para mantener narrativa temporal.  
+- KPIs recomendados:  
+  - `%Preparación = SUM(HorasPrep)/SUM(HorasProd)`  
+  - `%Parada = SUM(HorasPara)/SUM(HorasProd)`  
+- Para navegación secuencial: usar `ConCuboSecuenciasBloques_Rango` con `SecuenciaGlobalSQL`.  
+
+---
+
+## 📝 Changelog (Medoro 10)
+- ✅ Nueva vista `ConCuboSecuenciasBloques` con consolidación diaria por bloques y sort key estable.  
+- ✅ Nueva vista `ConCuboSecuenciasBloques_Rango` con índice global y clave textual.  
+- ✅ Guía de integración con Power BI y validaciones SQL.  
+
+---
+
+## 👤 Autor
+**Marcelo F. López Castro**  
+_SQL Server · Power BI · Data Analytics_
 
